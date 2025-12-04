@@ -1,0 +1,102 @@
+modules = ["nodejs-20", "web", "postgresql-16"]
+run = "npm run dev"
+hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist"]
+
+[nix]
+channel = "stable-24_05"
+packages = ["openssh"]
+
+[deployment]
+deploymentTarget = "autoscale"
+build = ["npm", "run", "build"]
+run = ["npm", "run", "start"]
+
+[env]
+PORT = "5000"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run dev"
+waitForPort = 5000
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 33009
+externalPort = 3002
+
+[[ports]]
+localPort = 33349
+externalPort = 8080
+
+[[ports]]
+localPort = 33359
+externalPort = 5000
+
+[[ports]]
+localPort = 34807
+externalPort = 6800
+
+[[ports]]
+localPort = 34859
+externalPort = 8000
+
+[[ports]]
+localPort = 35693
+externalPort = 4200
+
+[[ports]]
+localPort = 36557
+externalPort = 5173
+
+[[ports]]
+localPort = 38785
+externalPort = 8081
+
+[[ports]]
+localPort = 39169
+externalPort = 6000
+
+[[ports]]
+localPort = 39297
+externalPort = 8008
+
+[[ports]]
+localPort = 44281
+externalPort = 8099
+
+[[ports]]
+localPort = 44873
+externalPort = 3001
+
+[[ports]]
+localPort = 46047
+externalPort = 3003
+
+[[ports]]
+localPort = 46611
+externalPort = 3000
+
+[[ports]]
+localPort = 46623
+externalPort = 9000
+
+[agent]

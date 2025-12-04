@@ -1,0 +1,175 @@
+/* React Quill Custom Styles */
+.wysiwyg-editor .ql-toolbar {
+  border: 1px solid hsl(var(--border));
+  border-bottom: 2px solid hsl(var(--border));
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  background: hsl(var(--muted));
+  padding: 12px;
+  box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1);
+}
+
+.wysiwyg-editor .ql-container {
+  border: 1px solid hsl(var(--border));
+  border-top: none;
+  border-bottom-left-radius: 6px;
+  border-bottom-right-radius: 6px;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: inherit;
+}
+
+.wysiwyg-editor .ql-editor {
+  color: hsl(var(--foreground));
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 16px;
+}
+
+.wysiwyg-editor .ql-editor.ql-blank::before {
+  color: hsl(var(--muted-foreground));
+  font-style: normal;
+}
+
+/* Simplified toolbar - hide problematic buttons and replace with text */
+.wysiwyg-editor .ql-toolbar button {
+  color: hsl(var(--foreground));
+  border-radius: 4px;
+  padding: 4px 6px;
+  margin: 2px;
+  font-size: 0; /* Hide default icons */
+  position: relative;
+  min-width: 24px;
+  height: 24px;
+}
+
+/* Text replacements for icons */
+.wysiwyg-editor .ql-toolbar button::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 11px;
+  font-weight: 500;
+  color: currentColor;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-bold::after {
+  content: "B";
+  font-weight: bold;
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-italic::after {
+  content: "I";
+  font-style: italic;
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-underline::after {
+  content: "U";
+  text-decoration: underline;
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-list[value="ordered"]::after {
+  content: "1.";
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-list[value="bullet"]::after {
+  content: "•";
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-link::after {
+  content: "🔗";
+  font-size: 12px;
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-clean::after {
+  content: "⌫";
+  font-size: 12px;
+}
+
+/* Picker styles */
+.wysiwyg-editor .ql-toolbar .ql-picker {
+  color: hsl(var(--foreground));
+  font-size: 12px;
+}
+
+.wysiwyg-editor .ql-toolbar .ql-picker-label {
+  color: hsl(var(--foreground));
+  /* padding: 4px 8px; */
+  border-radius: 4px;
+}
+
+.wysiwyg-editor .ql-toolbar .ql-picker-options {
+  background: white;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.25);
+  z-index: 9999;
+  position: absolute;
+}
+
+.wysiwyg-editor .ql-toolbar .ql-picker-item {
+  color: hsl(var(--foreground));
+}
+
+.wysiwyg-editor .ql-toolbar .ql-picker-item:hover {
+  background: hsl(var(--accent));
+}
+
+/* Button states */
+.wysiwyg-editor .ql-toolbar button:hover {
+  background: hsl(var(--accent));
+  color: hsl(var(--foreground));
+}
+
+.wysiwyg-editor .ql-toolbar button.ql-active {
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+}
+
+/* Tooltip styles */
+.wysiwyg-editor .ql-tooltip {
+  background: white;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: hsl(var(--foreground));
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.25);
+  z-index: 9999;
+  position: absolute;
+  min-width: 220px;
+  padding: 8px 12px;
+  left: 0% !important;
+}
+
+/* Ensure tooltip doesn't get cut off on the left */
+.wysiwyg-editor .ql-tooltip.ql-editing {
+  left: 50% !important;
+  transform: translateX(-50%);
+}
+
+/* Adjust tooltip arrow if visible */
+.wysiwyg-editor .ql-tooltip:before {
+  border-top-color: hsl(var(--border));
+}
+
+.wysiwyg-editor .ql-tooltip input[type=text] {
+  background: hsl(var(--background));
+  border: 1px solid hsl(var(--border));
+  border-radius: 4px;
+  color: hsl(var(--foreground));
+  padding: 4px 8px;
+}
+
+/* Dark mode adjustments */
+.dark .wysiwyg-editor .ql-toolbar {
+  background: hsl(var(--background));
+}
+
+.dark .wysiwyg-editor .ql-container {
+  background: hsl(var(--background));
+}
+
+.dark .wysiwyg-editor .ql-editor {
+  color: hsl(var(--foreground));
+}

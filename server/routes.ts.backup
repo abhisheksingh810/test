@@ -1,0 +1,2344 @@
+import type { Express, Request, Response } from "express";
+import { createServer, type Server } from "http";
+import cookieParser from "cookie-parser";
+import { storage } from "./storage";
+import bcrypt from "bcrypt";
+import { 
+  insertUserSchema, 
+  createUserSchema, 
+  adminEditUserSchema, 
+  insertCourseNodeSchema,
+  insertAssessmentSchema,
+  insertAssessmentSectionSchema,
+  insertSectionMarkingOptionSchema,
+  insertAssessmentGradeBoundarySchema,
+  assessmentGradeBoundaries,
+  type UserRole, 
+  roleHierarchy 
+} from "@shared/schema";
+import { db } from "./db";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+import { randomBytes, createHmac } from "crypto";
+import { emailService } from "./services/emailService";
+import { getAzureBlobService, initializeAzureBlobService } from "./services/azureBlobService";
+
+// Helper function to get content type based on file extension
+function getContentType(fileExtension: string): string {
+  const contentTypes: Record<string, string> = {
+    'pdf': 'application/pdf',
+    'doc': 'application/msword',
+    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'txt': 'text/plain',
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'gif': 'image/gif'
+  };
+  return contentTypes[fileExtension?.toLowerCase()] || 'application/octet-stream';
+}
+
+// Extend Request interface to include user
+interface AuthenticatedRequest extends Request {
+  user?: any;
+}
+
+// Session middleware
+const requireAuth = async (req: AuthenticatedRequest, res: Response, next: any) => {
+  const sessionToken = req.headers.authorization?.replace('Bearer ', '') || req.cookies?.sessionToken;
+  
+  if (!sessionToken) {
+    return res.status(401).json({ message: "Authentication required" });
+  }
+  
+  const session = await storage.getSessionByToken(sessionToken);
+  if (!session || session.expiresAt < new Date()) {
+    return res.status(401).json({ message: "Invalid or expired session" });
+  }
+  
+  const user = await storage.getUser(session.userId);
+  if (!user) {
+    return res.status(401).json({ message: "User not found" });
+  }
+  
+  req.user = user;
+  next();
+};
+
+// Role-based access control
+const requireRole = (minRole: UserRole) => {
+  return (req: AuthenticatedRequest, res: Response, next: any) => {
+    const userRole = req.user?.role as UserRole;
+    if (!userRole || roleHierarchy[userRole] < roleHierarchy[minRole]) {
+      return res.status(403).json({ message: "Insufficient permissions" });
+    }
+    next();
+  };
+};
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  app.use(cookieParser());
+  
+  // Initialize Azure Blob Storage service if credentials are available
+  try {
+    if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
+      await initializeAzureBlobService();
+      console.log('Azure Blob Storage service initialized successfully');
+    } else {
+      console.warn('Azure Blob Storage credentials not found - file uploads will use fallback storage');
+    }
+  } catch (error) {
+    console.error('Failed to initialize Azure Blob Storage service:', error);
+    console.warn('File uploads will use fallback storage');
+    
+    // Don't prevent server startup if Azure fails to initialize
+    // The fallback storage mechanism will handle file uploads
+  }
+  
+  // Authentication routes
+  app.post('/api/auth/login', async (req, res) => {
+    try {
+      const { username, password } = req.body;
+      
+      if (!username || !password) {
+        return res.status(400).json({ message: "Username and password are required" });
+      }
+      
+      const user = await storage.getUserByUsername(username);
+      if (!user) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+      
+      const isValidPassword = await bcrypt.compare(password, user.password);
+      if (!isValidPassword) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+      
+      // Update user status to active on successful login if it was pending
+      if (user.status === 'pending') {
+        await storage.updateUser(user.id, { status: 'active' });
+        user.status = 'active'; // Update the local object too
+      }
+      
+      // Create session
+      const sessionToken = randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+      
+      await storage.createSession({
+        userId: user.id,
+        sessionToken,
+        expiresAt
+      });
+      
+      res.cookie('sessionToken', sessionToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 7 * 24 * 60 * 60 * 1000
+      });
+      
+      const { password: _, ...userWithoutPassword } = user;
+      res.json({ user: userWithoutPassword, sessionToken });
+    } catch (error) {
+      console.error('Login error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.post('/api/auth/logout', requireAuth, async (req: any, res) => {
+    try {
+      const sessionToken = req.headers.authorization?.replace('Bearer ', '') || req.cookies?.sessionToken;
+      if (sessionToken) {
+        await storage.deleteSession(sessionToken);
+      }
+      res.clearCookie('sessionToken');
+      res.json({ message: "Logged out successfully" });
+    } catch (error) {
+      console.error('Logout error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.get('/api/auth/me', requireAuth, (req: any, res) => {
+    const { password: _, ...userWithoutPassword } = req.user;
+    res.json(userWithoutPassword);
+  });
+
+  // Profile management routes
+  app.put('/api/profile', requireAuth, async (req: any, res) => {
+    try {
+      const userId = req.user.id;
+      const { updateProfileSchema } = await import("@shared/schema");
+      const updates = updateProfileSchema.parse(req.body);
+      
+      // Hash password if provided
+      if (updates.password) {
+        const bcrypt = await import('bcrypt');
+        updates.password = await bcrypt.hash(updates.password, 10);
+      }
+      
+      const user = await storage.updateUser(userId, updates);
+      const { password: _, ...userWithoutPassword } = user;
+      res.json(userWithoutPassword);
+    } catch (error) {
+      console.error('Update profile error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/profile/password', requireAuth, async (req: any, res) => {
+    try {
+      const userId = req.user.id;
+      const { changePasswordSchema } = await import("@shared/schema");
+      const bcrypt = await import('bcrypt');
+      
+      const { currentPassword, newPassword } = changePasswordSchema.parse(req.body);
+      
+      // Verify current password
+      const user = await storage.getUser(userId);
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      const isValidPassword = await bcrypt.compare(currentPassword, user.password);
+      if (!isValidPassword) {
+        return res.status(400).json({ message: "Current password is incorrect" });
+      }
+      
+      // Update with new password
+      const hashedPassword = await bcrypt.hash(newPassword, 10);
+      await storage.updateUser(userId, { password: hashedPassword });
+      
+      res.json({ message: "Password updated successfully" });
+    } catch (error) {
+      console.error('Change password error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Forgot password routes
+  app.post('/api/auth/forgot-password', async (req, res) => {
+    try {
+      const { forgotPasswordSchema } = await import("@shared/schema");
+      const { randomBytes } = await import('crypto');
+      
+      const { email } = forgotPasswordSchema.parse(req.body);
+      
+      // Check if user exists
+      const user = await storage.getUserByEmail(email);
+      if (!user) {
+        // Don't reveal if email exists or not for security
+        return res.json({ message: "If an account with this email exists, you will receive a password reset link." });
+      }
+      
+      // Generate reset token
+      const resetToken = randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      
+      // Store the token
+      await storage.createPasswordResetToken({
+        userId: user.id,
+        token: resetToken,
+        expiresAt,
+        used: "false"
+      });
+      
+      // Create reset URL
+      const resetUrl = `${req.protocol}://${req.get('host')}/reset-password?token=${resetToken}`;
+      
+      // Send email
+      try {
+        const { emailService } = await import('./services/emailService');
+        const systemSettings = await storage.getAllSystemSettings();
+        const emailTemplate = await storage.getEmailTemplateByKey('forgot_password');
+        
+        if (emailTemplate) {
+          await emailService.sendForgotPasswordEmail(
+            systemSettings,
+            emailTemplate,
+            {
+              to: email,
+              resetUrl,
+              userName: user.firstName || user.username,
+              platformName: "Avado E-Assessment Platform"
+            }
+          );
+        }
+      } catch (emailError) {
+        console.error('Failed to send reset email:', emailError);
+        // Continue without failing - token is still valid
+      }
+      
+      res.json({ message: "If an account with this email exists, you will receive a password reset link." });
+    } catch (error) {
+      console.error('Forgot password error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/auth/reset-password', async (req, res) => {
+    try {
+      const { resetPasswordSchema } = await import("@shared/schema");
+      const bcrypt = await import('bcrypt');
+      
+      const { token, newPassword } = resetPasswordSchema.parse(req.body);
+      
+      // Find the reset token
+      const resetToken = await storage.getPasswordResetToken(token);
+      if (!resetToken) {
+        return res.status(400).json({ message: "Invalid or expired reset token" });
+      }
+      
+      // Check if token is expired
+      if (new Date() > resetToken.expiresAt) {
+        return res.status(400).json({ message: "Reset token has expired" });
+      }
+      
+      // Check if token is already used
+      if (resetToken.used === "true") {
+        return res.status(400).json({ message: "Reset token has already been used" });
+      }
+      
+      // Get the user
+      const user = await storage.getUser(resetToken.userId);
+      if (!user) {
+        return res.status(400).json({ message: "User not found" });
+      }
+      
+      // Update password
+      const hashedPassword = await bcrypt.hash(newPassword, 10);
+      await storage.updateUser(user.id, { password: hashedPassword });
+      
+      // Mark token as used
+      await storage.markPasswordResetTokenAsUsed(token);
+      
+      res.json({ message: "Password has been reset successfully" });
+    } catch (error) {
+      console.error('Reset password error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // User management routes
+  app.get('/api/users/statistics', requireAuth, async (req, res) => {
+    try {
+      const stats = await storage.getUserStatistics();
+      res.json(stats);
+    } catch (error) {
+      console.error('Get user statistics error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.get('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { search, role, status, page = '1', limit = '10' } = req.query;
+      const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
+      
+      const result = await storage.getAllUsers({
+        search: search as string,
+        role: role as UserRole,
+        status: status as string,
+        limit: parseInt(limit as string),
+        offset
+      });
+      
+      // Remove passwords from response
+      const usersWithoutPasswords = result.users.map(({ password, ...user }) => user);
+      
+      res.json({
+        users: usersWithoutPasswords,
+        total: result.total,
+        page: parseInt(page as string),
+        limit: parseInt(limit as string)
+      });
+    } catch (error) {
+      console.error('Get users error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.post('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const userData = createUserSchema.parse(req.body);
+      
+      // Check if email already exists
+      const existingUser = await storage.getUserByEmail(userData.email);
+      if (existingUser) {
+        return res.status(400).json({ message: "A user with this email address already exists" });
+      }
+      
+      // Prevent admins from creating superadmin accounts
+      if (userData.role === 'superadmin' && (req as any).user.role !== 'superadmin') {
+        return res.status(403).json({ message: "Only superadmins can create superadmin accounts" });
+      }
+      
+      // Generate username from email (part before @)
+      const username = userData.email.split('@')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+      
+      // Check if generated username already exists, if so add a number
+      let finalUsername = username;
+      let counter = 1;
+      while (await storage.getUserByUsername(finalUsername)) {
+        finalUsername = `${username}${counter}`;
+        counter++;
+      }
+      
+      // Generate a temporary password (user will need to reset it)
+      const tempPassword = Math.random().toString(36).slice(-12);
+      const hashedPassword = await bcrypt.hash(tempPassword, 10);
+      
+      const user = await storage.createUser({
+        username: finalUsername,
+        email: userData.email,
+        password: hashedPassword,
+        role: userData.role,
+        status: 'pending', // User needs to set up their account
+      });
+      
+      // Send invitation email
+      try {
+        const settings = await storage.getAllSystemSettings();
+        await emailService.sendInvitationEmail(user.email, {
+          userName: user.username,
+          userRole: user.role,
+          tempPassword: tempPassword,
+          loginUrl: `${req.protocol}://${req.get('host')}/login`
+        }, settings);
+        
+        console.log(`Invitation email sent successfully to ${user.email}`);
+      } catch (emailError) {
+        console.error('Failed to send invitation email:', emailError);
+        // Don't fail the user creation if email fails
+      }
+      
+      const { password: _, ...userWithoutPassword } = user;
+      res.status(201).json({
+        ...userWithoutPassword,
+        emailSent: true // Indicate that invitation email was attempted
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid user data", errors: error.errors });
+      }
+      console.error('Create user error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.put('/api/users/:id', requireAuth, requireRole('admin'), async (req: any, res) => {
+    try {
+      const { id } = req.params;
+      
+      // Validate the request body using adminEditUserSchema
+      const validation = adminEditUserSchema.safeParse(req.body);
+      if (!validation.success) {
+        return res.status(400).json({ 
+          message: "Invalid input data", 
+          errors: validation.error.errors 
+        });
+      }
+      
+      const updates = validation.data;
+      
+      const existingUser = await storage.getUser(id);
+      if (!existingUser) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Prevent admins from modifying superadmin accounts
+      if (existingUser.role === 'superadmin' && req.user.role !== 'superadmin') {
+        return res.status(403).json({ message: "Only superadmins can modify superadmin accounts" });
+      }
+      
+      // Prevent admins from promoting users to superadmin
+      if (updates.role === 'superadmin' && req.user.role !== 'superadmin') {
+        return res.status(403).json({ message: "Only superadmins can assign superadmin role" });
+      }
+      
+      // Hash password if provided
+      if (updates.password) {
+        updates.password = await bcrypt.hash(updates.password, 10);
+      }
+      
+      const user = await storage.updateUser(id, updates);
+      const { password: _, ...userWithoutPassword } = user;
+      res.json(userWithoutPassword);
+    } catch (error) {
+      console.error('Update user error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.delete('/api/users/:id', requireAuth, requireRole('admin'), async (req: any, res) => {
+    try {
+      const { id } = req.params;
+      
+      const existingUser = await storage.getUser(id);
+      if (!existingUser) {
+        return res.status(404).json({ message: "User not found" });
+      }
+      
+      // Prevent admins from deleting superadmin accounts
+      if (existingUser.role === 'superadmin' && req.user.role !== 'superadmin') {
+        return res.status(403).json({ message: "Only superadmins can delete superadmin accounts" });
+      }
+      
+      // Delete user sessions first
+      await storage.deleteUserSessions(id);
+      await storage.deleteUser(id);
+      
+      res.json({ message: "User deleted successfully" });
+    } catch (error) {
+      console.error('Delete user error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  // System settings routes
+  app.get('/api/settings', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const settings = await storage.getAllSystemSettings();
+      res.json(settings);
+    } catch (error) {
+      console.error('Get settings error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+  
+  app.post('/api/settings', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const settings = req.body; // Array of settings
+      
+      if (!Array.isArray(settings)) {
+        return res.status(400).json({ message: "Settings must be an array" });
+      }
+      
+      const updatedSettings = [];
+      for (const setting of settings) {
+        const updated = await storage.upsertSystemSetting({
+          ...setting,
+          updatedBy: (req as any).user.id
+        });
+        updatedSettings.push(updated);
+      }
+      
+      res.json(updatedSettings);
+    } catch (error) {
+      console.error('Update settings error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Test TurnItIn connection
+  app.post('/api/settings/test-turnitin', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { apiUrl, apiKey } = req.body;
+      
+      if (!apiUrl || !apiKey) {
+        return res.status(400).json({ message: "API URL and API Key are required" });
+      }
+
+      // Test connection using TurnItIn's features-enabled endpoint
+      let cleanApiUrl = apiUrl.replace(/\/+$/, ''); // Remove trailing slashes
+      
+      // Handle different URL formats - check if /api is already in the URL
+      let testUrl;
+      if (cleanApiUrl.includes('/api/v1')) {
+        // URL already has /api/v1, just append the endpoint
+        testUrl = `${cleanApiUrl}/features-enabled`;
+      } else if (cleanApiUrl.includes('/api')) {
+        // URL has /api but not v1, append v1/features-enabled
+        testUrl = `${cleanApiUrl}/v1/features-enabled`;
+      } else {
+        // URL doesn't have /api, add the full path
+        testUrl = `${cleanApiUrl}/api/v1/features-enabled`;
+      }
+
+      console.log(`Testing TurnItIn connection to: ${testUrl}`);
+      
+      const response = await fetch(testUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'X-Turnitin-Integration-Name': 'Avado E-Assessment Platform',
+          'X-Turnitin-Integration-Version': '1.0.0',
+          'Content-Type': 'application/json'
+        }
+      });
+
+      console.log(`TurnItIn API response: ${response.status} ${response.statusText}`);
+
+      if (response.ok) {
+        const features = await response.json();
+        res.json({ 
+          success: true, 
+          message: "Connection successful",
+          features 
+        });
+      } else {
+        const errorText = await response.text();
+        console.error(`TurnItIn API error: ${errorText}`);
+        // Always return 400 for failed connection tests, not the original status code
+        // This ensures the frontend treats it as an error consistently
+        res.status(400).json({ 
+          success: false, 
+          message: `Connection failed: ${response.status} ${response.statusText}`,
+          error: errorText 
+        });
+      }
+    } catch (error) {
+      console.error('TurnItIn test connection error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: "Failed to test connection: " + (error as Error).message 
+      });
+    }
+  });
+
+  // Test SMTP connection
+  app.post('/api/settings/test-smtp', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { host, port, username, password, fromEmail, fromName, useTls } = req.body;
+      
+      if (!host || !username || !password) {
+        return res.status(400).json({ message: "SMTP Host, Username, and Password are required" });
+      }
+
+      // Dynamically import nodemailer to avoid issues with ES modules
+      const nodemailer = await import('nodemailer');
+      
+      console.log(`Testing SMTP connection to: ${host}:${port}`);
+      
+      // Create transporter
+      const transporter = nodemailer.default.createTransport({
+        host: host,
+        port: parseInt(port) || 587,
+        secure: parseInt(port) === 465, // true for 465, false for other ports
+        auth: {
+          user: username,
+          pass: password,
+        },
+        tls: useTls ? {
+          // Do not fail on invalid certs for testing
+          rejectUnauthorized: false
+        } : undefined
+      });
+
+      // Verify connection
+      await transporter.verify();
+      
+      // Send a test email if fromEmail is provided
+      if (fromEmail) {
+        const testEmail = {
+          from: fromName ? `"${fromName}" <${fromEmail}>` : fromEmail,
+          to: fromEmail, // Send test email to the configured from address
+          subject: 'HubSpot SMTP Test - Connection Successful',
+          text: `This is a test email sent from your e-assessment platform to verify the HubSpot SMTP configuration.\n\nSMTP Server: ${host}:${port}\nUsername: ${username}\nTLS Enabled: ${useTls}\n\nIf you received this email, your SMTP configuration is working correctly.`,
+          html: `
+            <h2>HubSpot SMTP Test - Connection Successful</h2>
+            <p>This is a test email sent from your e-assessment platform to verify the HubSpot SMTP configuration.</p>
+            <ul>
+              <li><strong>SMTP Server:</strong> ${host}:${port}</li>
+              <li><strong>Username:</strong> ${username}</li>
+              <li><strong>TLS Enabled:</strong> ${useTls}</li>
+            </ul>
+            <p><em>If you received this email, your SMTP configuration is working correctly.</em></p>
+          `
+        };
+
+        await transporter.sendMail(testEmail);
+        console.log('Test email sent successfully');
+      }
+
+      res.json({ 
+        success: true, 
+        message: fromEmail ? "Connection successful and test email sent" : "Connection successful"
+      });
+    } catch (error) {
+      console.error('SMTP test connection error:', error);
+      res.status(400).json({ 
+        success: false, 
+        message: "SMTP connection failed: " + (error as Error).message 
+      });
+    }
+  });
+
+  // OAuth 1.0 signature validation function
+  function validateOAuthSignature(req: any, consumerSecret: string): boolean {
+    const {
+      oauth_consumer_key,
+      oauth_timestamp,
+      oauth_nonce,
+      oauth_signature_method,
+      oauth_version,
+      oauth_signature
+    } = req.body;
+
+    console.log('OAuth validation - Received parameters:', {
+      oauth_consumer_key,
+      oauth_timestamp,
+      oauth_nonce,
+      oauth_signature_method,
+      oauth_signature: oauth_signature?.substring(0, 10) + '...',
+      consumerSecret: consumerSecret?.substring(0, 5) + '...',
+      originalUrl: req.originalUrl,
+      basePath: req.originalUrl.split('?')[0]
+    });
+
+    // Check required OAuth parameters
+    if (!oauth_consumer_key || !oauth_timestamp || !oauth_nonce || !oauth_signature_method || !oauth_signature) {
+      console.log('OAuth validation failed - missing required parameters');
+      return false;
+    }
+
+    // Only support HMAC-SHA1 for now
+    if (oauth_signature_method !== 'HMAC-SHA1') {
+      console.log('OAuth validation failed - unsupported signature method:', oauth_signature_method);
+      return false;
+    }
+
+    // Create signature base string
+    const params = { ...req.body };
+    delete params.oauth_signature; // Remove signature from parameters
+
+    // Get both the base URL and the full URL with parameters
+    // LMS might sign either the base endpoint or the full URL with query parameters
+    const basePath = req.originalUrl.split('?')[0];
+    const fullPath = req.originalUrl;
+    
+    // Try different URL constructions as LMS might be using different schemes
+    const baseUrls = [
+      // Try with full URL including query parameters (correct OAuth 1.0 behavior)
+      `${req.protocol}://${req.get('host')}${fullPath}`,
+      `https://${req.get('host')}${fullPath}`,
+      `http://${req.get('host')}${fullPath}`,
+      // Also try base URL without parameters (for backwards compatibility)
+      `${req.protocol}://${req.get('host')}${basePath}`,
+      `https://${req.get('host')}${basePath}`,
+      `http://${req.get('host')}${basePath}`
+    ];
+
+    // Extract URL parameters if present
+    const urlParams = req.originalUrl.includes('?') ? req.originalUrl.split('?')[1] : '';
+    const urlParametersObj = {};
+    if (urlParams) {
+      new URLSearchParams(urlParams).forEach((value, key) => {
+        urlParametersObj[key] = value;
+      });
+    }
+    
+    // According to OAuth 1.0 spec, URL parameters should be included in signature calculation
+    const allParams = { ...params, ...urlParametersObj };
+
+    // Sort all parameters alphabetically and encode properly
+    const sortedParams = Object.keys(allParams)
+      .sort()
+      .map(key => {
+        const value = allParams[key];
+        return `${encodeURIComponent(key)}=${encodeURIComponent(value || '')}`;
+      })
+      .join('&');
+
+    for (const baseUrl of baseUrls) {
+      // For URLs with query parameters, we need to strip them from the base URL
+      // because they're already included in the parameter list
+      const cleanBaseUrl = baseUrl.split('?')[0];
+      const signatureBaseString = `POST&${encodeURIComponent(cleanBaseUrl)}&${encodeURIComponent(sortedParams)}`;
+      
+      // Create signing key (consumer secret + "&" + token secret, but we don't use token secret in LTI)
+      const signingKey = `${encodeURIComponent(consumerSecret)}&`;
+
+      // Generate signature
+      const expectedSignature = createHmac('sha1', signingKey)
+        .update(signatureBaseString)
+        .digest('base64');
+
+      console.log(`Trying baseUrl: ${cleanBaseUrl}`);
+      console.log(`All parameters: ${JSON.stringify(allParams, null, 2)}`);
+      console.log(`Sorted params string: ${sortedParams}`);
+      console.log(`Signature base string: ${signatureBaseString}`);
+      console.log(`Expected signature: ${expectedSignature}`);
+      
+      if (oauth_signature === expectedSignature) {
+        console.log('Signature validation successful!');
+        return true;
+      }
+    }
+
+    console.log('All signature attempts failed');
+    console.log('Received signature:', oauth_signature);
+    
+    return false;
+  }
+
+  // Instruction steps routes
+  app.get('/api/instruction-steps', async (req, res) => {
+    try {
+      const steps = await storage.getAllInstructionSteps();
+      res.json(steps);
+    } catch (error) {
+      console.error('Get instruction steps error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Get instruction steps for a specific set (by ID or slug)
+  app.get('/api/instruction-steps/:setId', async (req, res) => {
+    try {
+      const { setId } = req.params;
+      
+      let steps = [];
+      
+      // Check if it looks like a UUID (instruction set ID)
+      if (setId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+        // Get steps by instruction set ID
+        steps = await storage.getInstructionStepsBySet(setId);
+      } else {
+        // Try to find by slug first
+        let instructionSet = await storage.getInstructionSetBySlug(setId);
+        
+        // If not found by slug, try by instruction set code
+        if (!instructionSet) {
+          instructionSet = await storage.getInstructionSetByCode(setId);
+        }
+        
+        if (instructionSet) {
+          steps = await storage.getInstructionStepsBySet(instructionSet.id);
+        }
+      }
+      
+      console.log(`📋 Fetched ${steps.length} steps for instruction set: ${setId}`);
+      res.json(steps);
+    } catch (error) {
+      console.error('Get instruction steps by set error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Instruction sets routes
+  app.get('/api/instruction-sets', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const sets = await storage.getAllInstructionSets();
+      res.json(sets);
+    } catch (error) {
+      console.error('Get instruction sets error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/instruction-sets', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const setData = req.body;
+      const newSet = await storage.createInstructionSet(setData);
+      
+      // Create default instruction steps for the new set
+      const defaultSteps = [
+        {
+          instructionSetId: newSet.id,
+          stepNumber: '1',
+          title: 'Welcome to the assessment',
+          content: '<p>Welcome to your assessment submission portal. Please review the instructions carefully before proceeding with your submission.</p>',
+          stepType: 'info' as const,
+          checkboxItems: [],
+          isActive: 'true'
+        },
+        {
+          instructionSetId: newSet.id,
+          stepNumber: '2', 
+          title: 'How to submit your assessment',
+          content: '<p>Please ensure your submission meets all requirements:</p><ul><li>File format must be PDF, DOC, or DOCX</li><li>Include your CIPD membership number on the front cover</li><li>Add accurate word count to your front cover</li><li>Check all formatting requirements</li></ul>',
+          stepType: 'info' as const,
+          checkboxItems: [],
+          isActive: 'true'
+        },
+        {
+          instructionSetId: newSet.id,
+          stepNumber: '3',
+          title: 'Please confirm agreement to the statement(s)',
+          content: '<p>Before proceeding to upload your assignment, please confirm that you agree to all the following statements:</p>',
+          stepType: 'checkbox' as const,
+          checkboxItems: [
+            "I confirm I've read and understood the submission instructions and previous feedback and I answered \"Yes\" to all questions on the Submission requirements page.",
+            "I confirm that my work does not contain any AI generated content.",
+            "I confirm that I have added the first 7 digits of my CIPD membership number accurately to my front cover.",
+            "I confirm that I have added the accurate word count to my front cover.",
+            "I confirm that I have read the assessment regulations and understand that if I am found to have 'copied' from published work without acknowledgment, or from other learner's work, this may be regarded as plagiarism and an assessment offence and leads to failure in the relevant unit and formal disciplinary action in line with the Avado's malpractice policy.",
+            "I agree to this work being subjected to scrutiny by textual analysis software.",
+            "I understand that my work may be used for future academic/quality assurance purposes in accordance with the provisions of Data Protection legislation.",
+            "I understand that the work/evidence submitted for assessment may not be returned to me and that I have retained a copy for my records.",
+            "I understand that until such time as the assessment grade has been confirmed through internal quality assurance and CIPD moderation it is not final.",
+            "I understand the consequences of malpractice and accept that any violation of this agreement may result in disciplinary action."
+          ],
+          isActive: 'true'
+        }
+      ];
+
+      // Create the default steps
+      for (const step of defaultSteps) {
+        await storage.createInstructionStep(step);
+      }
+
+      console.log(`✅ Created instruction set "${newSet.name}" with 3 default steps`);
+      res.json(newSet);
+    } catch (error) {
+      console.error('Create instruction set error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/instruction-sets/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const setData = req.body;
+      const updatedSet = await storage.updateInstructionSet(id, setData);
+      res.json(updatedSet);
+    } catch (error) {
+      console.error('Update instruction set error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.delete('/api/instruction-sets/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      await storage.deleteInstructionSet(id);
+      res.json({ message: "Instruction set deleted successfully" });
+    } catch (error) {
+      console.error('Delete instruction set error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/instruction-steps', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const steps = req.body; // Array of steps
+      
+      if (!Array.isArray(steps)) {
+        return res.status(400).json({ message: "Steps must be an array" });
+      }
+      
+      if (steps.length === 0) {
+        return res.json([]);
+      }
+      
+      // Verify all steps belong to the same instruction set
+      const instructionSetId = steps[0].instructionSetId;
+      if (!instructionSetId) {
+        return res.status(400).json({ message: "All steps must have an instructionSetId" });
+      }
+      
+      const invalidSteps = steps.filter(step => step.instructionSetId !== instructionSetId);
+      if (invalidSteps.length > 0) {
+        return res.status(400).json({ message: "All steps must belong to the same instruction set" });
+      }
+      
+      console.log(`🔧 Processing ${steps.length} instruction steps for set: ${instructionSetId}`);
+      
+      // First, delete all existing steps for this instruction set to avoid duplicates
+      await storage.deleteInstructionStepsBySet(instructionSetId);
+      
+      const updatedSteps = [];
+      for (const step of steps) {
+        console.log('📝 Creating step:', { title: step.title, stepType: step.stepType, stepNumber: step.stepNumber });
+        
+        // Remove the ID field to force creation of new steps
+        const { id, createdAt, updatedAt, ...cleanStep } = step;
+        const updated = await storage.createInstructionStep(cleanStep);
+        updatedSteps.push(updated);
+      }
+      
+      console.log(`✅ Successfully saved ${updatedSteps.length} steps for instruction set: ${instructionSetId}`);
+      res.json(updatedSteps);
+    } catch (error) {
+      console.error('Update instruction steps error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Email template routes
+  app.get('/api/email-templates', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const templates = await storage.getAllEmailTemplates();
+      res.json(templates);
+    } catch (error) {
+      console.error('Get email templates error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.get('/api/email-templates/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const template = await storage.getEmailTemplate(id);
+      
+      if (!template) {
+        return res.status(404).json({ message: "Email template not found" });
+      }
+      
+      res.json(template);
+    } catch (error) {
+      console.error('Get email template error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/email-templates', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const template = await storage.createEmailTemplate(req.body);
+      res.json(template);
+    } catch (error) {
+      console.error('Create email template error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/email-templates/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const template = await storage.updateEmailTemplate(id, req.body);
+      res.json(template);
+    } catch (error) {
+      console.error('Update email template error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.delete('/api/email-templates/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      await storage.deleteEmailTemplate(id);
+      res.json({ message: "Email template deleted successfully" });
+    } catch (error) {
+      console.error('Delete email template error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Email sending routes
+  app.post('/api/email/send', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { emailService } = await import('./services/emailService');
+      const { templateKey, to, customProperties, contactProperties } = req.body;
+      
+      // Get system settings
+      const systemSettings = await storage.getAllSystemSettings();
+      
+      // Get email template
+      const emailTemplate = await storage.getEmailTemplateByKey(templateKey);
+      if (!emailTemplate) {
+        return res.status(404).json({ message: "Email template not found" });
+      }
+      
+      const result = await emailService.sendTransactionalEmail(
+        systemSettings,
+        emailTemplate,
+        {
+          to,
+          templateKey,
+          customProperties,
+          contactProperties
+        }
+      );
+      
+      res.json({ success: true, result });
+    } catch (error) {
+      console.error('Send email error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: error instanceof Error ? error.message : "Internal server error" 
+      });
+    }
+  });
+
+  app.post('/api/email/send-invite', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { emailService } = await import('./services/emailService');
+      const { email, inviteUrl, inviterName, role, platformName } = req.body;
+      
+      // Get system settings
+      const systemSettings = await storage.getAllSystemSettings();
+      
+      // Get invite user email template
+      const emailTemplate = await storage.getEmailTemplateByKey('invite_user');
+      if (!emailTemplate) {
+        return res.status(404).json({ message: "Invite user email template not found" });
+      }
+      
+      const result = await emailService.sendInviteUserEmail(
+        systemSettings,
+        emailTemplate,
+        {
+          to: email,
+          inviteUrl,
+          inviterName,
+          role,
+          platformName
+        }
+      );
+      
+      res.json({ success: true, result });
+    } catch (error) {
+      console.error('Send invite email error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: error instanceof Error ? error.message : "Internal server error" 
+      });
+    }
+  });
+
+  app.post('/api/email/send-forgot-password', requireAuth, async (req, res) => {
+    try {
+      const { emailService } = await import('./services/emailService');
+      const { email, resetUrl, userName, platformName } = req.body;
+      
+      // Get system settings
+      const systemSettings = await storage.getAllSystemSettings();
+      
+      // Get forgot password email template
+      const emailTemplate = await storage.getEmailTemplateByKey('forgot_password');
+      if (!emailTemplate) {
+        return res.status(404).json({ message: "Forgot password email template not found" });
+      }
+      
+      const result = await emailService.sendForgotPasswordEmail(
+        systemSettings,
+        emailTemplate,
+        {
+          to: email,
+          resetUrl,
+          userName,
+          platformName
+        }
+      );
+      
+      res.json({ success: true, result });
+    } catch (error) {
+      console.error('Send forgot password email error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: error instanceof Error ? error.message : "Internal server error" 
+      });
+    }
+  });
+
+  // Completion message route for file submissions
+  app.get('/api/completion-message/:instructionSetCode', async (req, res) => {
+    try {
+      const { instructionSetCode } = req.params;
+      
+      if (!instructionSetCode) {
+        return res.status(400).json({ message: "Instruction set code is required" });
+      }
+      
+      const decodedInstructionSetCode = decodeURIComponent(instructionSetCode);
+      console.log(`🎯 Looking for completion message for instruction set code: ${decodedInstructionSetCode}`);
+      
+      // Find the instruction set by instruction set code
+      const instructionSet = await storage.getInstructionSetByCode(decodedInstructionSetCode);
+      
+      if (!instructionSet) {
+        console.log(`❌ Instruction set not found for instruction set code: ${decodedInstructionSetCode}`);
+        return res.status(404).json({ message: "Instruction set not found" });
+      }
+      
+      console.log(`✅ Found instruction set: ${instructionSet.name}, completion message: ${instructionSet.completionMessage ? 'exists' : 'not set'}, submission title: ${instructionSet.submissionTitle ? 'exists' : 'not set'}`);
+      
+      // Return the completion message and submission title
+      res.json({ 
+        message: instructionSet.completionMessage || null,
+        submissionTitle: instructionSet.submissionTitle || null
+      });
+    } catch (error) {
+      console.error('Get completion message error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // LTI Routes
+  app.post('/api/lti/launch', async (req, res) => {
+    try {
+      // Generate a unique launch ID
+      const launchId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
+      
+      // Extract LTI parameters (these would normally come from the LMS)
+      const {
+        oauth_consumer_key,
+        user_id,
+        lis_person_contact_email_primary,
+        lis_person_name_full,
+        lis_person_name_given,
+        lis_person_name_family,
+        context_title,
+        context_type,
+        resource_link_title,
+        launch_presentation_return_url,
+        resource_link_id,
+        context_id,
+        tool_consumer_instance_guid,
+        tool_consumer_instance_name,
+        custom_assignment_id,
+        custom_action,
+        cis, // Custom instruction set parameter
+        cas, // Custom assessment code parameter
+        lti_message_type,
+        roles
+      } = req.body;
+
+      console.log('LTI Launch parameters:', {
+        custom_action,
+        cis, // Custom instruction set parameter
+        cas, // Custom assessment code parameter
+        oauth_consumer_key,
+        user_id
+      });
+
+      // Parse URL parameters for additional custom parameters
+      const urlParams = new URLSearchParams(req.url?.split('?')[1] || '');
+      const urlCustomAction = urlParams.get('custom_action');
+      const urlCis = urlParams.get('cis'); // Custom instruction set parameter
+      const urlCas = urlParams.get('cas'); // Custom assessment code parameter
+
+      // Use body params first, then fall back to URL params
+      const finalCustomAction = custom_action || urlCustomAction;
+      const finalCustomInstructionSet = (cis || urlCis)?.trim(); // Custom instruction set parameter
+      const finalCustomAssessmentCode = (cas || urlCas)?.trim(); // Custom assessment code parameter
+
+      console.log('Final custom parameters:', {
+        finalCustomAction,
+        finalCustomInstructionSet,
+        finalCustomAssessmentCode
+      });
+
+      // Validate required parameters (cis and cas)
+      let instructionSet = null;
+      let assessment = null;
+      
+      // Both parameters are required for proper operation
+      if (!finalCustomInstructionSet && !finalCustomAssessmentCode) {
+        console.log('Missing required LTI parameters: cis and cas');
+        return res.status(400).send(`
+          <html>
+            <head><title>Missing Required Parameters</title></head>
+            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+              <h1 style="color: #d32f2f;">Error: Missing Required Parameters</h1>
+              <p>Both 'cis' (custom instruction set) and 'cas' (custom assessment code) parameters are required.</p>
+              <p>Please configure your LMS to send these parameters with the LTI launch.</p>
+            </body>
+          </html>
+        `);
+      }
+      
+      // Validate custom instruction set (cis) parameter
+      if (finalCustomInstructionSet) {
+        // First try by instruction set code, then by ID, then by slug
+        instructionSet = await storage.getInstructionSetByCode(finalCustomInstructionSet);
+        if (!instructionSet) {
+          instructionSet = await storage.getInstructionSet(finalCustomInstructionSet);
+        }
+        if (!instructionSet) {
+          instructionSet = await storage.getInstructionSetBySlug(finalCustomInstructionSet);
+        }
+        
+        if (!instructionSet) {
+          console.log(`Unknown instruction set: ${finalCustomInstructionSet}`);
+          return res.status(400).send(`
+            <html>
+              <head><title>Unknown Instruction Set</title></head>
+              <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: #d32f2f;">Error: Unknown Instruction Set</h1>
+                <p>The instruction set "${finalCustomInstructionSet}" was not found.</p>
+                <p>Please check the instruction set identifier and try again.</p>
+              </body>
+            </html>
+          `);
+        }
+      }
+      
+      // Validate custom assessment code (cas) parameter
+      if (finalCustomAssessmentCode) {
+        assessment = await storage.getAssessmentsByCode(finalCustomAssessmentCode);
+        
+        if (!assessment) {
+          console.log(`Unknown assessment code: ${finalCustomAssessmentCode}`);
+          return res.status(400).send(`
+            <html>
+              <head><title>Unknown Assessment Code</title></head>
+              <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: #d32f2f;">Error: Unknown Assessment Code</h1>
+                <p>The assessment code "${finalCustomAssessmentCode}" was not found.</p>
+                <p>Please check the assessment code and try again.</p>
+              </body>
+            </html>
+          `);
+        }
+      }
+      
+      console.log('Parameter validation successful:', {
+        instructionSet: instructionSet ? `${instructionSet.name} (${instructionSet.id})` : 'not provided',
+        assessment: assessment ? `${assessment.name} (${assessment.code})` : 'not provided'
+      });
+
+      // Get consumer key and secret from settings
+      const consumerKeySetting = await storage.getSystemSetting('lti_consumer_key');
+      const consumerSecretSetting = await storage.getSystemSetting('lti_shared_secret');
+
+      // Verify consumer key exists and matches
+      if (!consumerKeySetting || !consumerSecretSetting || consumerKeySetting.value !== oauth_consumer_key) {
+        return res.status(401).json({ 
+          success: false, 
+          message: 'Invalid consumer key' 
+        });
+      }
+
+      // Validate OAuth signature
+      if (!validateOAuthSignature(req, consumerSecretSetting.value!)) {
+        return res.status(401).json({ 
+          success: false, 
+          message: 'Invalid OAuth signature - check your consumer secret' 
+        });
+      }
+
+      // Create LTI launch session (expires in 1 hour)
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      const ltiSession = await storage.createLtiLaunchSession({
+        launchId,
+        consumerKey: oauth_consumer_key,
+        userId: user_id,
+        userEmail: lis_person_contact_email_primary,
+        userName: lis_person_name_full,
+        courseName: context_title,
+        assignmentTitle: resource_link_title,
+        returnUrl: launch_presentation_return_url,
+        resourceLinkId: resource_link_id,
+        contextId: context_id,
+        toolConsumerInstanceGuid: tool_consumer_instance_guid,
+        customParams: JSON.stringify({
+          custom_assignment_id,
+          custom_action: finalCustomAction,
+          cis: finalCustomInstructionSet, // Custom instruction set parameter
+          cas: finalCustomAssessmentCode, // Custom assessment code parameter
+          instruction_set_id: instructionSet?.id,
+          assessment_id: assessment?.id,
+          assessment_code: assessment?.code
+        }),
+        // Additional LTI fields for student tracking
+        ltiMessageType: lti_message_type,
+        contextType: context_type,
+        contextTitle: context_title,
+        roles: roles,
+        lisPersonNameGiven: lis_person_name_given,
+        lisPersonNameFamily: lis_person_name_family,
+        lisPersonNameFull: lis_person_name_full,
+        lisPersonContactEmailPrimary: lis_person_contact_email_primary,
+        toolConsumerInstanceName: tool_consumer_instance_name,
+        customAction: finalCustomAction,
+        customInstructionSet: finalCustomInstructionSet,
+        customAssessmentCode: finalCustomAssessmentCode,
+        expiresAt
+      });
+
+      // Create comprehensive session record with all LTI fields extracted during launch (foolproof approach)
+      const sessionRecord = await storage.createLtiSessionRecord({
+        launchId,
+        lmsUserId: user_id,
+        consumerName: tool_consumer_instance_name,
+        role: roles,
+        firstName: lis_person_name_given,
+        lastName: lis_person_name_family,
+        fullName: lis_person_name_full,
+        email: lis_person_contact_email_primary,
+        customAction: finalCustomAction,
+        customInstructionSet: finalCustomInstructionSet,
+        customAssessmentCode: finalCustomAssessmentCode,
+        contextType: context_type,
+        contextTitle: context_title,
+        resourceLinkId: resource_link_id,
+        resourceLinkTitle: resource_link_title,
+        contextId: context_id,
+        consumerKey: oauth_consumer_key,
+        toolConsumerInstanceGuid: tool_consumer_instance_guid,
+        returnUrl: launch_presentation_return_url,
+        hasFileSubmission: "false",
+        sessionExpiry: expiresAt
+      });
+
+      console.log('📋 LTI session record created during launch with comprehensive data:', {
+        sessionRecordId: sessionRecord.id,
+        launchId: sessionRecord.launchId,
+        extractedFields: {
+          lmsUserId: sessionRecord.lmsUserId,
+          consumerName: sessionRecord.consumerName,
+          role: sessionRecord.role,
+          firstName: sessionRecord.firstName,
+          lastName: sessionRecord.lastName,
+          fullName: sessionRecord.fullName,
+          email: sessionRecord.email,
+          customAssessmentCode: sessionRecord.customAssessmentCode,
+          customAction: sessionRecord.customAction,
+          contextType: sessionRecord.contextType,
+          contextTitle: sessionRecord.contextTitle
+        }
+      });
+
+      // Redirect to assignment page with assessment code parameter
+      const redirectUrl = finalCustomAssessmentCode 
+        ? `/lti/assignment/${launchId}?assessment_code=${finalCustomAssessmentCode}`
+        : `/lti/assignment/${launchId}`;
+      
+      console.log(`Redirecting to: ${redirectUrl}`);
+      res.redirect(redirectUrl);
+    } catch (error) {
+      console.error('LTI launch error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: 'Internal server error during LTI launch' 
+      });
+    }
+  });
+
+  app.get('/api/lti/session/:launchId', async (req, res) => {
+    try {
+      const { launchId } = req.params;
+      const session = await storage.getLtiLaunchSession(launchId);
+      
+      if (!session) {
+        return res.status(404).json({ 
+          success: false, 
+          message: 'LTI session not found' 
+        });
+      }
+
+      // Check if session has expired
+      if (new Date() > session.expiresAt) {
+        return res.status(401).json({ 
+          success: false, 
+          message: 'LTI session expired' 
+        });
+      }
+
+      res.json({ success: true, session });
+    } catch (error) {
+      console.error('Get LTI session error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: 'Internal server error' 
+      });
+    }
+  });
+
+  app.post('/api/lti/submit', async (req, res) => {
+    try {
+      const { launchId, files } = req.body; // Changed to accept array of files
+      
+      if (!files || !Array.isArray(files) || files.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'No files provided for submission'
+        });
+      }
+      
+      console.log('🚀 LTI Multiple File Upload Started:', {
+        launchId,
+        fileCount: files.length,
+        files: files.map(f => ({ name: f.fileName, size: f.fileSize, type: f.fileType }))
+      });
+      
+      // Get and validate LTI session
+      const session = await storage.getLtiLaunchSession(launchId);
+      if (!session || new Date() > session.expiresAt) {
+        console.log('❌ LTI session validation failed:', {
+          sessionExists: !!session,
+          expired: session ? new Date() > session.expiresAt : 'no session',
+          launchId
+        });
+        return res.status(401).json({ 
+          success: false, 
+          message: 'Invalid or expired LTI session' 
+        });
+      }
+
+      // Get the comprehensive session record with all extracted LTI data
+      const sessionRecord = await storage.getLtiSessionRecord(launchId);
+      if (!sessionRecord || new Date() > sessionRecord.sessionExpiry) {
+        console.log('❌ LTI session record validation failed:', {
+          recordExists: !!sessionRecord,
+          expired: sessionRecord ? new Date() > sessionRecord.sessionExpiry : 'no record',
+          launchId
+        });
+        return res.status(401).json({ 
+          success: false, 
+          message: 'Invalid or expired LTI session record' 
+        });
+      }
+
+      console.log('✅ LTI session record validated, processing multiple files:', {
+        sessionRecordId: sessionRecord.id,
+        launchId: sessionRecord.launchId,
+        fileCount: files.length,
+        extractedFields: {
+          lmsUserId: sessionRecord.lmsUserId,
+          consumerName: sessionRecord.consumerName,
+          role: sessionRecord.role,
+          fullName: sessionRecord.fullName,
+          email: sessionRecord.email,
+          customAssessmentCode: sessionRecord.customAssessmentCode
+        }
+      });
+
+      // Process and upload all files
+      const uploadedFiles = [];
+      let totalFileSize = 0;
+      
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const { fileName, fileSize, fileType, fileData } = file;
+        
+        console.log(`🔄 Processing file ${i + 1}/${files.length}: ${fileName}`);
+        
+        let azureBlobUrl, azureBlobName, fileUrl;
+        
+        try {
+          // Convert base64 file data to buffer
+          const base64Data = fileData.split(',')[1]; // Remove data:type;base64, prefix
+          const fileBuffer = Buffer.from(base64Data, 'base64');
+          
+          // Get Azure Blob Service and upload file
+          const azureService = getAzureBlobService();
+          const uploadResult = await azureService.uploadFile({
+            fileName,
+            fileBuffer,
+            contentType: getContentType(fileType),
+            metadata: {
+              studentId: session.userId || 'unknown',
+              launchId: launchId,
+              courseName: session.courseName || 'unknown',
+              assignmentTitle: session.assignmentTitle || 'unknown',
+              uploadOrder: (i + 1).toString(),
+              uploadedAt: new Date().toISOString()
+            }
+          });
+          
+          azureBlobUrl = uploadResult.url;
+          azureBlobName = uploadResult.blobName;
+          fileUrl = uploadResult.url; // Use Azure URL as the main file URL
+          
+          console.log(`✅ File ${i + 1} uploaded to Azure: ${fileName}`);
+        } catch (azureError) {
+          console.error(`❌ Azure upload failed for file ${i + 1}:`, azureError);
+          // Fallback to local file reference if Azure upload fails
+          fileUrl = `/uploads/${Date.now()}-${fileName}`;
+          console.log(`⚠️ Using local reference for file ${i + 1}: ${fileName}`);
+        }
+        
+        const fileSizeBytes = parseFloat(fileSize) * 1024 * 1024; // Convert MB to bytes
+        totalFileSize += fileSizeBytes;
+        
+        uploadedFiles.push({
+          fileName,
+          originalFileName: fileName,
+          fileSize,
+          fileType,
+          fileMimeType: getContentType(fileType),
+          fileUrl,
+          azureBlobUrl: azureBlobUrl || null,
+          azureBlobName: azureBlobName || null,
+          azureContainerName: 'rogoreplacement',
+          uploadOrder: i + 1
+        });
+      }
+      
+      // Create main submission record
+      const submissionData = {
+        ltiSessionRecordId: sessionRecord.id,
+        ltiLaunchId: launchId,
+        fileCount: files.length,
+        totalFileSize: `${(totalFileSize / 1024 / 1024).toFixed(2)}MB`,
+        // Store comprehensive LTI fields from session record
+        lmsUserId: sessionRecord.lmsUserId,
+        consumerName: sessionRecord.consumerName,
+        role: sessionRecord.role,
+        firstName: sessionRecord.firstName,
+        lastName: sessionRecord.lastName,
+        fullName: sessionRecord.fullName,
+        email: sessionRecord.email,
+        customInstructionSet: sessionRecord.customInstructionSet,
+        customAssessmentCode: sessionRecord.customAssessmentCode,
+        customAction: sessionRecord.customAction,
+        contextType: sessionRecord.contextType,
+        contextTitle: sessionRecord.contextTitle,
+        // Legacy fields for backward compatibility (using first file data)
+        fileName: uploadedFiles[0]?.fileName || null,
+        fileSize: uploadedFiles[0]?.fileSize || null,
+        fileType: uploadedFiles[0]?.fileType || null,
+        fileUrl: uploadedFiles[0]?.fileUrl || null,
+        azureBlobUrl: uploadedFiles[0]?.azureBlobUrl || null,
+        azureBlobName: uploadedFiles[0]?.azureBlobName || null,
+        azureContainerName: 'rogoreplacement',
+        studentUserId: sessionRecord.lmsUserId,
+        studentEmail: sessionRecord.email,
+        studentName: sessionRecord.fullName,
+        courseName: sessionRecord.contextTitle
+      };
+
+      console.log('📝 Creating submission with multiple files:', {
+        fileCount: submissionData.fileCount,
+        totalFileSize: submissionData.totalFileSize,
+        ltiLaunchId: submissionData.ltiLaunchId,
+        extractedFields: {
+          lmsUserId: submissionData.lmsUserId,
+          consumerName: submissionData.consumerName,
+          role: submissionData.role,
+          fullName: submissionData.fullName,
+          email: submissionData.email,
+          customAssessmentCode: submissionData.customAssessmentCode
+        }
+      });
+
+      const submission = await storage.createSubmission(submissionData);
+
+      // Create individual file records
+      const submissionFileRecords = uploadedFiles.map(file => ({
+        submissionId: submission.id,
+        ...file
+      }));
+
+      const createdFiles = await storage.createMultipleSubmissionFiles(submissionFileRecords);
+
+      // Mark the session record as having a file submission for tracking
+      await storage.markSessionWithFileSubmission(launchId);
+
+      console.log('✅ Multi-file submission created successfully:', {
+        submissionId: submission.id,
+        fileCount: submission.fileCount,
+        totalFileSize: submission.totalFileSize,
+        individualFiles: createdFiles.length,
+        linkedSessionRecordId: submission.ltiSessionRecordId,
+        submittedAt: submission.submittedAt
+      });
+
+      res.json({ 
+        success: true, 
+        submission,
+        files: createdFiles,
+        returnUrl: session.returnUrl 
+      });
+    } catch (error) {
+      console.error('LTI multi-file submission error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: 'Internal server error during submission' 
+      });
+    }
+  });
+
+  // SMTP connection test endpoint
+  app.post('/api/test-smtp', requireAuth, requireRole('admin'), async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const settings = await storage.getAllSystemSettings();
+      const success = await emailService.testConnection(settings);
+      
+      if (success) {
+        res.json({ success: true, message: 'SMTP connection successful' });
+      } else {
+        res.status(400).json({ success: false, message: 'SMTP connection failed' });
+      }
+    } catch (error) {
+      console.error('SMTP test error:', error);
+      res.status(500).json({ 
+        success: false, 
+        message: error instanceof Error ? error.message : 'SMTP connection test failed' 
+      });
+    }
+  });
+
+  // Azure Blob Storage SAS URL generation endpoint
+  app.get('/api/azure/sas-url/:blobName', requireAuth, async (req, res) => {
+    try {
+      const { blobName } = req.params;
+      const { expiryMinutes = 60 } = req.query;
+      
+      if (!process.env.AZURE_STORAGE_CONNECTION_STRING) {
+        return res.status(503).json({
+          success: false,
+          message: 'Azure Blob Storage not configured'
+        });
+      }
+      
+      const azureService = getAzureBlobService();
+      const sasUrl = await azureService.getSasUrl(blobName, Number(expiryMinutes));
+      
+      res.json({
+        success: true,
+        sasUrl,
+        expiryMinutes: Number(expiryMinutes)
+      });
+    } catch (error) {
+      console.error('SAS URL generation error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to generate SAS URL'
+      });
+    }
+  });
+
+  // Test Azure Blob Storage connection endpoint
+  app.get('/api/azure/test-connection', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      if (!process.env.AZURE_STORAGE_CONNECTION_STRING) {
+        return res.status(400).json({
+          success: false,
+          message: 'AZURE_STORAGE_CONNECTION_STRING environment variable not configured'
+        });
+      }
+      
+      const azureService = getAzureBlobService();
+      
+      // Test by listing files in the LTI_Uploads directory
+      const files = await azureService.listFiles('LTI_Uploads/');
+      
+      res.json({
+        success: true,
+        message: 'Azure Blob Storage connection successful',
+        containerName: 'rogoreplacement',
+        filesFound: files.length,
+        sasTokenConfigured: !!process.env.AZURE_SAS_TOKEN
+      });
+    } catch (error) {
+      console.error('Azure connection test error:', error);
+      res.status(500).json({
+        success: false,
+        message: `Azure connection failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+      });
+    }
+  });
+
+  // Course Management API Routes
+  
+  // Course Nodes (Hierarchical Structure)
+  app.get('/api/course-nodes', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const nodes = await storage.getAllCourseNodes();
+      res.json(nodes);
+    } catch (error) {
+      console.error('Get course nodes error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.get('/api/course-nodes/root', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const rootNodes = await storage.getRootCourseNodes();
+      res.json(rootNodes);
+    } catch (error) {
+      console.error('Get root course nodes error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.get('/api/course-nodes/:id/children', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const children = await storage.getCourseNodeChildren(id);
+      res.json(children);
+    } catch (error) {
+      console.error('Get course node children error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/course-nodes', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const validatedData = insertCourseNodeSchema.parse(req.body);
+      const node = await storage.createCourseNode(validatedData);
+      res.json(node);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Create course node error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/course-nodes/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validatedData = insertCourseNodeSchema.partial().parse(req.body);
+      const node = await storage.updateCourseNode(id, validatedData);
+      res.json(node);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Update course node error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.delete('/api/course-nodes/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      await storage.deleteCourseNode(id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Delete course node error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/course-nodes/:id/duplicate', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const duplicatedNode = await storage.duplicateCourseNode(id);
+      res.json(duplicatedNode);
+    } catch (error) {
+      console.error('Duplicate course node error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Move course node
+  app.put('/api/course-nodes/:id/move', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { parentId } = req.body;
+      
+      // Validate that the new parent exists (if provided)
+      if (parentId) {
+        const parentExists = await storage.getCourseNode(parentId);
+        if (!parentExists) {
+          return res.status(400).json({ message: 'Parent node does not exist' });
+        }
+      }
+      
+      const updatedNode = await storage.updateCourseNode(id, { parentId });
+      res.json(updatedNode);
+    } catch (error) {
+      console.error('Move course node error:', error);
+      if (error instanceof Error && error.message.includes('not found')) {
+        res.status(404).json({ message: 'Course node not found' });
+      } else if (error instanceof Error && error.message.includes('circular')) {
+        res.status(400).json({ message: 'Cannot create circular reference' });
+      } else {
+        res.status(500).json({ message: 'Failed to move course node' });
+      }
+    }
+  });
+
+
+
+
+
+      }
+      
+      if (!validatedData.name || validatedData.name.trim() === '') {
+        return res.status(400).json({ message: "Course name is required" });
+      }
+      
+      const course = await storage.createCourse(validatedData);
+      res.json(course);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      
+      // Handle unique constraint violations
+      if ((error as any).code === '23505') {
+        if ((error as any).constraint?.includes('code')) {
+          return res.status(400).json({ message: "Course code already exists. Please choose a different code." });
+        }
+      }
+      
+      // Handle foreign key constraint violations
+      if ((error as any).code === '23503') {
+        if ((error as any).constraint === 'courses_category_id_fkey') {
+          return res.status(400).json({ message: "Selected course category does not exist" });
+        }
+      }
+      
+      console.error('Create course error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+      }
+      
+      // Handle unique constraint violations
+      if ((error as any).code === '23505') {
+        if ((error as any).constraint?.includes('code')) {
+          return res.status(400).json({ message: "Course code already exists. Please choose a different code." });
+        }
+      }
+      
+      // Handle foreign key constraint violations
+      if ((error as any).code === '23503') {
+        if ((error as any).constraint === 'courses_category_id_fkey') {
+          return res.status(400).json({ message: "Selected course category does not exist" });
+        }
+      }
+      
+      console.error('Update course error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+    } catch (error) {
+      // Handle foreign key constraint violations
+      if ((error as any).code === '23503') {
+        if ((error as any).constraint === 'assessments_course_node_id_fkey') {
+          return res.status(400).json({ 
+            message: "Cannot delete folder because it has associated assessments. Please delete all assessments for this folder first, or move them to another folder." 
+          });
+        }
+      }
+      
+      console.error('Delete course error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+      }
+      console.error('Duplicate course error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }  // Assessments
+  app.get('/api/assessments', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const assessments = await storage.getAllAssessments();
+      res.json(assessments);
+    } catch (error) {
+      console.error('Get assessments error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+
+  app.get('/api/assessments/course-node/:courseNodeId', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { courseNodeId } = req.params;
+      const assessments = await storage.getAssessmentsByCourseNode(courseNodeId);
+      res.json(assessments);
+    } catch (error) {
+      console.error('Get assessments by course node error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/assessments', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const validatedData = insertAssessmentSchema.parse(req.body);
+      
+      // Additional server-side validation
+      if (!validatedData.courseNodeId || validatedData.courseNodeId.trim() === '') {
+        return res.status(400).json({ message: "Folder selection is required" });
+      }
+      
+      if (!validatedData.code || validatedData.code.trim() === '') {
+        return res.status(400).json({ message: "Assessment code is required" });
+      }
+      
+      if (!validatedData.name || validatedData.name.trim() === '') {
+        return res.status(400).json({ message: "Assessment name is required" });
+      }
+      
+      const assessment = await storage.createAssessment(validatedData);
+      res.json(assessment);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      
+      // Handle foreign key constraint violations
+      if ((error as any).code === '23503') {
+        if ((error as any).constraint === 'assessments_course_node_id_fkey') {
+          return res.status(400).json({ message: "Selected folder does not exist" });
+        }
+        if ((error as any).constraint === 'assessments_instruction_set_id_fkey') {
+          return res.status(400).json({ message: "Selected instruction set does not exist" });
+        }
+      }
+      
+      // Handle unique constraint violations
+      if ((error as any).code === '23505') {
+        if ((error as any).constraint?.includes('code')) {
+          return res.status(400).json({ message: "Assessment code already exists. Please choose a different code." });
+        }
+        if ((error as any).constraint?.includes('assessment_id')) {
+          return res.status(400).json({ message: "Assessment ID already exists. Please try again." });
+        }
+      }
+      
+      console.error('Create assessment error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/assessments/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validatedData = insertAssessmentSchema.partial().parse(req.body);
+      const assessment = await storage.updateAssessment(id, validatedData);
+      res.json(assessment);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      
+      // Handle foreign key constraint violations
+      if ((error as any).code === '23503') {
+        if ((error as any).constraint === 'assessments_course_node_id_fkey') {
+          return res.status(400).json({ message: "Selected folder does not exist" });
+        }
+        if ((error as any).constraint === 'assessments_instruction_set_id_fkey') {
+          return res.status(400).json({ message: "Selected instruction set does not exist" });
+        }
+      }
+      
+      // Handle unique constraint violations
+      if ((error as any).code === '23505') {
+        if ((error as any).constraint?.includes('code')) {
+          return res.status(400).json({ message: "Assessment code already exists. Please choose a different code." });
+        }
+        if ((error as any).constraint?.includes('assessment_id')) {
+          return res.status(400).json({ message: "Assessment ID already exists. Please try again." });
+        }
+      }
+      
+      console.error('Update assessment error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.delete('/api/assessments/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      await storage.deleteAssessment(id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Delete assessment error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Move assessment
+  app.put('/api/assessments/:id/move', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { courseNodeId } = req.body;
+      
+      // Validate that the target node exists
+      if (courseNodeId) {
+        const nodeExists = await storage.getCourseNode(courseNodeId);
+        if (!nodeExists) {
+          return res.status(400).json({ message: 'Target folder does not exist' });
+        }
+      }
+      
+      const updatedAssessment = await storage.updateAssessment(id, { courseNodeId });
+      res.json(updatedAssessment);
+    } catch (error) {
+      console.error('Move assessment error:', error);
+      if (error instanceof Error && error.message.includes('not found')) {
+        res.status(404).json({ message: 'Assessment not found' });
+      } else {
+        res.status(500).json({ message: 'Failed to move assessment' });
+      }
+    }
+  });
+
+  // Assessment Sections
+  app.get('/api/assessments/:assessmentId/sections', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { assessmentId } = req.params;
+      const sections = await storage.getAssessmentSections(assessmentId);
+      res.json(sections);
+    } catch (error) {
+      console.error('Get assessment sections error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/assessments/:assessmentId/sections', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { assessmentId } = req.params;
+      const validatedData = insertAssessmentSectionSchema.parse({
+        ...req.body,
+        assessmentId
+      });
+      const section = await storage.createAssessmentSection(validatedData);
+      res.json(section);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Create assessment section error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/assessments/sections/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const validatedData = insertAssessmentSectionSchema.partial().parse(req.body);
+      const section = await storage.updateAssessmentSection(id, validatedData);
+      res.json(section);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Update assessment section error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.delete('/api/assessments/sections/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      await storage.deleteAssessmentSection(id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Delete assessment section error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/assessments/sections/:id/clone', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      const clonedSection = await storage.cloneAssessmentSection(id);
+      res.json(clonedSection);
+    } catch (error) {
+      console.error('Clone assessment section error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/assessments/:assessmentId/sections/reorder', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { assessmentId } = req.params;
+      const { sectionIds } = req.body;
+      
+      if (!Array.isArray(sectionIds)) {
+        return res.status(400).json({ message: "sectionIds must be an array" });
+      }
+      
+      await storage.reorderAssessmentSections(assessmentId, sectionIds);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Reorder assessment sections error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Section Marking Options
+  app.get('/api/sections/:sectionId/marking-options', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { sectionId } = req.params;
+      const options = await storage.getSectionMarkingOptions(sectionId);
+      res.json(options);
+    } catch (error) {
+      console.error('Get section marking options error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/sections/:sectionId/marking-options', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { sectionId } = req.params;
+      const validatedData = insertSectionMarkingOptionSchema.parse({
+        ...req.body,
+        sectionId
+      });
+      const option = await storage.createSectionMarkingOption(validatedData);
+      
+      // Get the assessment ID for this section to update grade boundary total marks
+      const section = await storage.getAssessmentSection(sectionId);
+      if (section) {
+        await storage.updateAssessmentTotalMarks(section.assessmentId);
+      }
+      
+      res.json(option);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Create section marking option error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/sections/marking-options/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      // Get the existing option to find the section and assessment
+      const existingOption = await storage.getSectionMarkingOptionById(id);
+      
+      const validatedData = insertSectionMarkingOptionSchema.partial().parse(req.body);
+      const option = await storage.updateSectionMarkingOption(id, validatedData);
+      
+      // Update grade boundary total marks if we have the section info
+      if (existingOption) {
+        const section = await storage.getAssessmentSection(existingOption.sectionId);
+        if (section) {
+          await storage.updateAssessmentTotalMarks(section.assessmentId);
+        }
+      }
+      
+      res.json(option);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Update section marking option error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.delete('/api/sections/marking-options/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      // Get the existing option to find the section and assessment before deletion
+      const existingOption = await storage.getSectionMarkingOptionById(id);
+      
+      await storage.deleteSectionMarkingOption(id);
+      
+      // Update grade boundary total marks if we have the section info
+      if (existingOption) {
+        const section = await storage.getAssessmentSection(existingOption.sectionId);
+        if (section) {
+          await storage.updateAssessmentTotalMarks(section.assessmentId);
+        }
+      }
+      
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Delete section marking option error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/sections/:sectionId/marking-options/reorder', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { sectionId } = req.params;
+      const { optionIds } = req.body;
+      
+      if (!Array.isArray(optionIds)) {
+        return res.status(400).json({ message: "optionIds must be an array" });
+      }
+      
+      await storage.reorderSectionMarkingOptions(sectionId, optionIds);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Reorder section marking options error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Assessment Grade Boundaries
+  app.get('/api/assessments/:assessmentId/grade-boundaries', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { assessmentId } = req.params;
+      const boundaries = await storage.getAssessmentGradeBoundaries(assessmentId);
+      res.json(boundaries);
+    } catch (error) {
+      console.error('Get assessment grade boundaries error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.post('/api/assessments/:assessmentId/grade-boundaries', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { assessmentId } = req.params;
+      
+      const validatedData = insertAssessmentGradeBoundarySchema.parse({
+        ...req.body,
+        assessmentId
+      });
+      const boundary = await storage.createAssessmentGradeBoundary(validatedData);
+      
+      // Update assessment total marks after creating grade boundary
+      await storage.updateAssessmentTotalMarks(assessmentId);
+      
+      res.json(boundary);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Create assessment grade boundary error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/assessments/grade-boundaries/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      
+      // Get the boundary to find the assessment ID
+      const existingBoundary = await db.select()
+        .from(assessmentGradeBoundaries)
+        .where(eq(assessmentGradeBoundaries.id, id))
+        .limit(1);
+      
+      if (existingBoundary.length === 0) {
+        return res.status(404).json({ message: "Grade boundary not found" });
+      }
+      
+      const validatedData = insertAssessmentGradeBoundarySchema.partial().parse(req.body);
+      const boundary = await storage.updateAssessmentGradeBoundary(id, validatedData);
+      
+      // Update assessment total marks after updating grade boundary
+      await storage.updateAssessmentTotalMarks(existingBoundary[0].assessmentId);
+      
+      res.json(boundary);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('Update assessment grade boundary error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.delete('/api/assessments/grade-boundaries/:id', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { id } = req.params;
+      await storage.deleteAssessmentGradeBoundary(id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Delete assessment grade boundary error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/assessments/:assessmentId/grade-boundaries/reorder', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { assessmentId } = req.params;
+      const { boundaryIds } = req.body;
+      
+      if (!Array.isArray(boundaryIds)) {
+        return res.status(400).json({ message: "boundaryIds must be an array" });
+      }
+      
+      await storage.reorderAssessmentGradeBoundaries(assessmentId, boundaryIds);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Reorder assessment grade boundaries error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.put('/api/assessments/:assessmentId/recalculate-total-marks', requireAuth, requireRole('admin'), async (req, res) => {
+    try {
+      const { assessmentId } = req.params;
+      await storage.updateAssessmentTotalMarks(assessmentId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Recalculate total marks error:', error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  const httpServer = createServer(app);
+  return httpServer;
+}

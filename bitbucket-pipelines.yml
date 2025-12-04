@@ -1,0 +1,138 @@
+image: atlassian/default-image:5
+
+pipelines:
+  branches:
+    UAT:
+      - step:
+          name: Build & Deploy
+          deployment: production
+          caches:
+            - node
+          script:
+            # Install dependencies
+            - npm install
+            
+            # Clean dist folder to ensure fresh build (removes old code with static vite imports)
+            - rm -rf dist/
+            
+            # Set environment variables for Vite build (from Bitbucket repository variables)
+            - export VITE_APP_MARKING_BUDDY_URL=$VITE_APP_MARKING_BUDDY_URL_UAT
+
+            # Build Vite frontend (outputs to dist folder)
+            - npm run build
+            
+            # Install Azure CLI (zip, curl, and other utilities are pre-installed in Atlassian default image)
+            - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+            
+            # Login with service principal
+            - az login --service-principal -u $AZURE_CLIENT_ID_UAT -p $AZURE_CLIENT_SECRET_UAT --tenant $AZURE_TENANT_ID_UAT
+            
+            # Create deployment package - explicitly include only required files
+            - zip -r deploy.zip dist/ migrations/ package.json package-lock.json \
+                -x "*.git*" \
+                -x "*.env*" \
+                -x "client/*" \
+                -x "node_modules/*" \
+                -x "database_*.sql" \
+                -x "attached_assets/*" \
+                -x "server/*.ts" \
+                -x "shared/*.ts" \
+                -x "*.md" \
+                -x "*.backup" \
+                -x ".replit*" \
+                -x "tailwind.config.ts" \
+                -x "vite.config.ts" \
+                -x "postcss.config.js" \
+                -x "tsconfig.json" \
+                -x "components.json" \
+                -x "drizzle.config.ts" \
+                -x "json2csv.d.ts" \
+                -x "env.example" \
+                -x "replit.md"
+                                    
+            # Check zip size
+            - ls -lh deploy.zip
+            
+            # Deploy using Azure CLI
+            - |
+              echo "Deploying to Azure App Service..."
+              az webapp deployment source config-zip \
+                --resource-group $AZURE_RESOURCE_GROUP_UAT \
+                --name $AZURE_APP_SERVICE_NAME_UAT \
+                --src deploy.zip \
+                --timeout 600 \
+                --verbose
+            
+            # Restart the app service
+            - az webapp restart --resource-group $AZURE_RESOURCE_GROUP_UAT --name $AZURE_APP_SERVICE_NAME_UAT
+            
+            - echo "Deployment to UAT completed successfully!"
+    main:
+      - step:
+          name: Build & Deploy
+          deployment: production
+          caches:
+            - node
+          script:
+            # Install dependencies
+            - npm install
+            
+            # Clean dist folder to ensure fresh build (removes old code with static vite imports)
+            - rm -rf dist/
+
+            # Set environment variables for Vite build (from Bitbucket repository variables)
+            - export VITE_APP_MARKING_BUDDY_URL=$VITE_APP_MARKING_BUDDY_URL_PROD
+            
+            # Build Vite frontend (outputs to dist folder)
+            - npm run build
+            
+            # Install Azure CLI (zip, curl, and other utilities are pre-installed in Atlassian default image)
+            - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+            
+            # Login with service principal
+            - az login --service-principal -u $AZURE_CLIENT_ID_PROD -p $AZURE_CLIENT_SECRET_PROD --tenant $AZURE_TENANT_ID_PROD
+            
+            # Create deployment package - explicitly include only required files
+            - zip -r deploy.zip dist/ migrations/ package.json package-lock.json \
+                -x "*.git*" \
+                -x "*.env*" \
+                -x "client/*" \
+                -x "node_modules/*" \
+                -x "database_*.sql" \
+                -x "attached_assets/*" \
+                -x "server/*.ts" \
+                -x "shared/*.ts" \
+                -x "*.md" \
+                -x "*.backup" \
+                -x ".replit*" \
+                -x "tailwind.config.ts" \
+                -x "vite.config.ts" \
+                -x "postcss.config.js" \
+                -x "tsconfig.json" \
+                -x "components.json" \
+                -x "drizzle.config.ts" \
+                -x "json2csv.d.ts" \
+                -x "env.example" \
+                -x "replit.md"
+                                    
+            # Check zip size
+            - ls -lh deploy.zip
+            
+            # Deploy using Azure CLI
+            - |
+              echo "Deploying to Azure App Service..."
+              az webapp deployment source config-zip \
+                --resource-group $AZURE_RESOURCE_GROUP_PROD \
+                --name $AZURE_APP_SERVICE_NAME_PROD \
+                --src deploy.zip \
+                --timeout 600 \
+                --verbose
+            
+            # Restart the app service
+            - az webapp restart --resource-group $AZURE_RESOURCE_GROUP_PROD --name $AZURE_APP_SERVICE_NAME_PROD
+            
+            - echo "Deployment to PROD completed successfully!"
+
+definitions:
+  caches:
+    node: node_modules
