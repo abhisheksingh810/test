@@ -3,8 +3,9 @@ set -e
 
 echo "🚀 Deploying migration service..."
 
-# Get script directory
+# Get script directory and project root (absolute paths)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SERVICE_NAME="rogo-migration"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 LOG_DIR="$SCRIPT_DIR/logs"
@@ -49,7 +50,7 @@ After=network.target
 [Service]
 Type=simple
 User=$USER
-WorkingDirectory=$SCRIPT_DIR/..
+WorkingDirectory=$PROJECT_DIR
 ExecStart=$WRAPPER_SCRIPT
 Restart=always
 RestartSec=10
@@ -59,6 +60,10 @@ StandardError=append:$LOG_DIR/migration-service-error.log
 [Install]
 WantedBy=multi-user.target
 EOF
+
+echo "✅ Service file created with:"
+echo "   WorkingDirectory: $PROJECT_DIR"
+echo "   Log directory: $LOG_DIR"
 
 # Reload systemd and enable service
 echo "🔄 Reloading systemd daemon..."
