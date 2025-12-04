@@ -49,3 +49,7 @@ coverage/
 
 # Compiled migration worker (generated at runtime)
 data-migration/migration-worker.js
+
+# Migration logs
+data-migration/logs/
+data-migration/run-migration.sh
